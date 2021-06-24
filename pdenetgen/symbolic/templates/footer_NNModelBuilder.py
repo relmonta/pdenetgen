@@ -198,9 +198,9 @@ template = '''
             self._make_trend_model()
             
             
-        for exclude_case in ['constant_functions','exogenous_functions']:
-            if hasattr(self,exclude_case):
-                raise NotImplementedError(f'Design of dynamical_model with {exclude_case} is not implemented')
+        # for exclude_case in ['constant_functions','exogenous_functions']:
+        #     if hasattr(self,exclude_case):
+        #         raise NotImplementedError(f'Design of dynamical_model with {exclude_case} is not implemented')
 
                 
         # Case 1 --  corresponds to the _trend_model if input is a single field                        
@@ -223,7 +223,15 @@ template = '''
         for shape in self._trend_model.input_shape:
             shape = shape[1:] # Exclude batch_size (assumed to be at first)
             shapes.append(shape)
-            dimensions.append(len(shape)-1)
+
+            dimension = len(shape)
+            if shape[0] == 1:
+              dimension -= 1
+            
+            if shape[-1] == 1:
+              dimension -= 1
+            
+            dimensions.append(dimension)
             
         max_dimension = max(dimensions)
         if max_dimension!=1:
@@ -234,8 +242,7 @@ template = '''
         
         if max_dimension in [1,2]:
             input_shape = (len(shapes),)+shapes[0]
-        elif max_dimension==3:
-            
+        elif max_dimension==3:            
             # a. check the size of 2D fields: this is given by the first 2D field.
             for shape, dimension in zip(shapes, dimensions):
                 if dimension==2:
@@ -279,31 +286,46 @@ template = '''
             return func
 
         inputs = []
+        i = 0
         if max_dimension in [1,2]:
             for k in range(len(shapes)):
-                inputs.append(keras.layers.Lambda(get_slice(max_dimension,k))(state))
-                #if max_dimension==1:
-                #    inputs.append(keras.layers.Lambda(lambda x : x[:,k,:,:])(state))
-                #
-                #if max_dimension==2:
-                #    inputs.append(keras.layers.Lambda(lambda x : x[:,k,:,:,:])(state))                    
+                if i < len(self.prognostic_functions):
+                    inputs.append(keras.layers.Lambda(get_slice(max_dimension,k))(state))
+                    i += 1
+                    #if max_dimension==1:
+                    #    inputs.append(keras.layers.Lambda(lambda x : x[:,k,:,:])(state))
+                    #
+                    #if max_dimension==2:
+                    #    inputs.append(keras.layers.Lambda(lambda x : x[:,k,:,:,:])(state))                    
+                else:
+                    inputs.append(keras.layers.Lambda(get_slice(max_dimension,k))(state))
+                    if inputs[i].shape[1] == 1:
+                        inputs[i] =  keras.layers.Reshape(inputs[i].shape[2:])(inputs[i])   
+                    i += 1
         else:
             k=0
             for shape, dimension in zip(shapes, dimensions):
                 if dimension==2:
-                    #inputs.append(keras.layers.Lambda(lambda x : x[:,k,:,:,:])(state))
-                    inputs.append(keras.layers.Lambda(get_slice(dimension,k))(state))
+                    if i < len(self.prognostic_functions):
+                        #inputs.append(keras.layers.Lambda(lambda x : x[:,k,:,:,:])(state))
+                        inputs.append(keras.layers.Lambda(get_slice(dimension,k))(state))
+                    else:
+                        inputs.append(keras.layers.Lambda(get_slice(dimension,k))(state))
+                        if inputs[i].shape[1] == 1:
+                            inputs[i] =  keras.layers.Reshape(inputs[i].shape[2:])(inputs[i])   
                     k += 1 
                 if dimension==3:
                     start = k
                     end = start+shape[0]
                     inputs.append(keras.layers.Lambda(get_slice_3d(start,end))(state))
                     k = end
+                i += 1
                     
         # 2. Compute the trend
         """ From PKF-Burgers code
         trend_u, trend_V, trend_nu = self._trend_model([u,V,nu_u_xx])
         """
+
         trends = self._trend_model(inputs)
         
         # 3. Outputs the trend as a single array
@@ -315,34 +337,60 @@ template = '''
         trend_nu = keras.layers.Reshape((1,self.input_shape_x,1))(trend_nu)
         """
         
-        reshape_trends = [] 
-        for trend, dimension in zip(trends, dimensions):
-            
-            #shape = tuple(dim.value for dim in trend.shape[1:])
-            # update from keras -> tensorflow.keras
-            shape = tuple(dim for dim in trend.shape[1:])
-            
+        reshaped_trends = [] 
+        reshape = False
+        if len(self.prognostic_functions) > 1:
+            for trend, dimension in zip(trends, dimensions[0:len(self.prognostic_functions)]):            
+                #shape = tuple(dim.value for dim in trend.shape[1:])
+                # update from keras -> tensorflow.keras
+                shape = tuple(dim for dim in trend.shape[1:])
+                
+                if dimension==1 or dimension==2:
+                    # for 1D fields like (128,1) transform into (1,128,1)
+                    # for 2D fields like (128,128,1) transform into (1,128,128,1)
+                    if shape[0] !=1:
+                        shape = (1,)+shape
+                        reshape = True
+                elif dimension==3:
+                    # 3D fields can be compated: two fields (36,128,128,1) become the single field (72,128,128,1)
+                    pass
+                else:
+                    raise NotImplementedError
+                if reshape:    
+                    reshaped_trends.append(keras.layers.Reshape(shape)(trend))
+                else:
+                    reshaped_trends.append(trend)
+            # 3.2 Concatenates all trends
+            """ From PKF-Burgers code:
+            trends = keras.layers.Concatenate(axis=1)([trend_u,trend_V,trend_nu])
+            """
+            trends = keras.layers.Concatenate(axis=1)(reshaped_trends)
+        else:
+            dimension = dimensions[0]
+            shape = tuple(dim for dim in trends.shape[1:])
+              
             if dimension==1 or dimension==2:
                 # for 1D fields like (128,1) transform into (1,128,1)
                 # for 2D fields like (128,128,1) transform into (1,128,128,1)
-                shape = (1,)+shape
+                if shape[0] !=1:
+                    shape = (1,)+shape
+                    reshape = True
             elif dimension==3:
                 # 3D fields can be compated: two fields (36,128,128,1) become the single field (72,128,128,1)
                 pass
             else:
-                raise NotImplementedError
-                
-            reshape_trends.append(keras.layers.Reshape(shape)(trend))
-        
-        # 3.2 Concatenates all trends
-        """ From PKF-Burgers code:
-        trends = keras.layers.Concatenate(axis=1)([trend_u,trend_V,trend_nu])
-        """
-        trends = keras.layers.Concatenate(axis=1)(reshape_trends)
+                raise NotImplementedError  
+                                
+            if reshape:    
+                reshaped_trends.append(keras.layers.Reshape(shape)(trends))
+            else:
+                reshaped_trends.append(trends)
+          
+        trends = reshaped_trends
         
         # 2.5 Compute the model       
         self._dynamical_trend = keras.models.Model(inputs=state,outputs=trends)    
-                
+              
     {% if exogenous_functions_flag %}
     
     def _make_exogenous_model(self):
